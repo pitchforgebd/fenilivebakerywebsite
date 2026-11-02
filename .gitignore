@@ -1,0 +1,69 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+/playwright-report
+/test-results
+/.lighthouseci
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+/backups
+/unibaazar-build
+/next-build.zip
+/release-info.json
+/artifact
+
+# A database dump must never reach git: it holds customer names, phones,
+# addresses and order history. The migration rehearsal that first needed
+# this guard was waived (ADR 0025), but the launch still takes a final
+# pre-wipe dump of production, so the guard stays. Belt and braces: the
+# scratch folder is ignored, and so is every .sql/.sql.gz/.dump anywhere
+# in the repo except the committed migrations.
+/.rehearsal
+*.sql
+*.sql.gz
+*.dump
+!prisma/migrations/**/*.sql
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+!.env.test.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+/public/uploads/*
+!/public/uploads/.gitkeep
+
+# Claude Code agent worktrees
+/.claude/worktrees

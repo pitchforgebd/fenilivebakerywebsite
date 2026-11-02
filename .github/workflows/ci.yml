@@ -1,0 +1,267 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # Mirrors the production host's thread ceiling (see ARCHITECTURE.md §12)
+    # so a thread-related regression is caught here, not after deploy.
+    env:
+      UV_THREADPOOL_SIZE: "2"
+      NEXT_TELEMETRY_DISABLED: "1"
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: unibaazar_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # §5.6's "npm audit in CI". The hard gate is `critical` on
+      # production dependencies, not `high`: the remaining highs all
+      # need major upgrades (prisma 7, zod 4, next 16) that are
+      # deliberately deferred to their own migration rather than bundled
+      # into a hardening phase — see
+      # docs/decisions/0023-phase-12-scope-hardening.md. The full report
+      # below is informational so a new issue is still visible in the log.
+      - name: Dependency audit (gate on critical, production deps)
+        run: npm audit --omit=dev --audit-level=critical
+
+      - name: Dependency audit (full report, informational)
+        if: always()
+        run: npm audit || true
+
+      # @prisma/client's own postinstall should already do this, but making
+      # it explicit removes any doubt and is cheap/idempotent.
+      - run: npx prisma generate
+
+      - run: npx playwright install --with-deps chromium
+
+      - uses: browser-actions/setup-chrome@v2
+        id: setup-chrome
+        with:
+          chrome-version: stable
+
+      - name: Write .env.test
+        run: |
+          cat > .env.test <<EOF
+          DATABASE_URL=mysql://root@127.0.0.1:3306/unibaazar_test
+          NEXT_PUBLIC_SITE_URL=http://127.0.0.1:3100
+          AUTH_SECRET=ci-only-secret-${{ github.run_id }}-not-for-production
+          CRON_SECRET=ci-only-cron-secret-${{ github.run_id }}
+          SETTINGS_ENCRYPTION_KEY=0152098de6c360c7d52575971e1edae428f7f059cb58acd65ebb16e43b9bc534
+          ALLOW_DESIGN_ROUTE=1
+          EOF
+
+      - run: npm run db:migrate:test
+      - run: npm run db:seed:test
+
+      # verify:ci, not verify:full: this job only installs chromium (above).
+      # Cross-browser (webkit/firefox) is the separate `cross-browser` job
+      # below, which installs those engines itself — verify:full's own
+      # composition includes test:e2e:cross, so calling it here would
+      # always fail at that step with "Executable doesn't exist". Hidden
+      # until 2026-10-30 behind two earlier bugs that failed before this
+      # job ever got this far — see ADR 0030.
+      - name: Run the full verify suite (typecheck, lint, unit, integration, e2e, a11y, lighthouse)
+        env:
+          CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: npm run verify:ci
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
+
+      - name: Upload Lighthouse reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighthouse-report
+          path: .lighthouseci/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Phase 12's cross-browser regression gate. Separate from `verify` so
+  # the common path isn't slowed by three engines; runs the same
+  # critical-path flow on WebKit (desktop + iOS) and Firefox.
+  cross-browser:
+    runs-on: ubuntu-latest
+    env:
+      UV_THREADPOOL_SIZE: "2"
+      NEXT_TELEMETRY_DISABLED: "1"
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: unibaazar_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx playwright install --with-deps webkit firefox
+
+      - name: Write .env.test
+        run: |
+          cat > .env.test <<EOF
+          DATABASE_URL=mysql://root@127.0.0.1:3306/unibaazar_test
+          NEXT_PUBLIC_SITE_URL=http://127.0.0.1:3100
+          AUTH_SECRET=ci-only-secret-${{ github.run_id }}-not-for-production
+          CRON_SECRET=ci-only-cron-secret-${{ github.run_id }}
+          SETTINGS_ENCRYPTION_KEY=0152098de6c360c7d52575971e1edae428f7f059cb58acd65ebb16e43b9bc534
+          ALLOW_DESIGN_ROUTE=1
+          EOF
+
+      - run: npm run db:migrate:test
+      - run: npm run db:seed:test
+      - run: npm run build:test
+      - run: npm run test:e2e:cross
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-cross-browser
+          path: playwright-report/
+          retention-days: 7
+
+  build-artifact:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      UV_THREADPOOL_SIZE: "2"
+      NEXT_TELEMETRY_DISABLED: "1"
+    # This job had never run against real content before 2026-10-30 (it's
+    # gated to pushes on main, and everything before today developed on
+    # phase branches). The first time it did, `next build` crashed
+    # repeatedly: several pages — not just a couple — read live DB data
+    # (Settings, CMS pages, blog posts) during prerendering, which threw
+    # every time against the unreachable DATABASE_URL this job used to
+    # set. ARCHITECTURE.md §3's claim that "no real DB connection is
+    # needed at build time" turned out not to hold for the actual
+    # codebase. Rather than hunting down and patching every such
+    # callsite under deploy pressure, this job now builds against a real,
+    # empty, migrated database — the same pattern the `verify` job
+    # already runs successfully end-to-end every push. See ADR 0031.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: unibaazar_build
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      # Full install (incl. devDependencies) because `next build` compiles
+      # TypeScript; production node_modules are pruned after the build below.
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      - name: Apply migrations to the throwaway build database
+        env:
+          DATABASE_URL: mysql://root@127.0.0.1:3306/unibaazar_build
+        run: npx prisma migrate deploy
+
+      - name: Build
+        env:
+          NEXT_PUBLIC_SITE_URL: https://unibaazar.com
+          DATABASE_URL: mysql://root@127.0.0.1:3306/unibaazar_build
+        run: npm run build
+
+      - name: Record the release SHA for /api/health
+        run: echo "{\"sha\":\"${{ github.sha }}\",\"builtAt\":\"$(date -u +%FT%TZ)\"}" > release-info.json
+
+      - name: Prune to production node_modules
+        run: npm prune --omit=dev
+
+      # `scripts` is not optional: deploy.yml invokes
+      # scripts/deploy/deploy-release.sh *from inside the unpacked
+      # release*, and that script in turn runs scripts/deploy/backup-db.sh
+      # and scripts/deploy/apply-migrations.sh. It was missing from this
+      # list until Phase 14, which would have failed the very first real
+      # deploy at its first command — nobody caught it because deploys
+      # were deliberately deferred until every phase was done
+      # (docs/decisions/0007-manual-deploy-trigger.md), so this pipeline
+      # had never actually run end to end. scripts/bootstrap-admin.cjs
+      # ships for the same reason: it is the only way to create the first
+      # admin on a fresh database.
+      - name: Package the release artifact
+        run: |
+          mkdir -p artifact
+          # --exclude must come BEFORE the paths: tar treats it
+          # positionally, so with it trailing (as it was until Phase 14)
+          # it silently applied to nothing and shipped .next/cache —
+          # hundreds of MB of webpack cache in every release.
+          tar -czf artifact/release.tar.gz \
+            --exclude='.next/cache' \
+            --exclude='public/uploads' \
+            .next \
+            public \
+            node_modules \
+            prisma \
+            scripts \
+            server.js \
+            seo-hook.cjs \
+            package.json \
+            package-lock.json \
+            release-info.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: artifact/release.tar.gz
+          retention-days: 14

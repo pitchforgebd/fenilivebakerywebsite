@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE `Customer` ADD COLUMN `tags` VARCHAR(500) NOT NULL DEFAULT '';
